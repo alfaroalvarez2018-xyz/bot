@@ -153,19 +153,24 @@ def enviar_mensaje_telegram(chat_id, texto, mostrar_botones=False):
             'resize_keyboard': False,
             'one_time_keyboard': False,
         }
+    if mostrar_botones and str(chat_id) != MI_TELEGRAM_ID:
+        payload['reply_markup']['keyboard'].append([{'text': '🚪 Salir del bot'}])
     return llamar_telegram('sendMessage', payload)
 
 
 def solicitar_telefono(chat_id, texto=None):
     return llamar_telegram('sendMessage', {
         'chat_id': chat_id,
-        'text': texto or ('Para comprobar tu acceso, pulsá Compartir mi teléfono. '
-                         'El bot verificará tu número contra la lista autorizada '
-                         'y guardará su vínculo con tu cuenta de Telegram.'),
+        'text': texto or ('Para ingresar, pulsá 📱 Vincularme y aceptá compartir '
+                         'el teléfono de tu cuenta de Telegram. El bot verificará '
+                         'tu número contra la lista autorizada y guardará su vínculo '
+                         'con tu cuenta. Si el botón está oculto, tocá el ícono de '
+                         'teclado o cuadrícula junto al campo de mensajes.'),
         'reply_markup': {
-            'keyboard': [[{'text': '📱 Compartir mi teléfono', 'request_contact': True}]],
+            'keyboard': [[{'text': '📱 Vincularme', 'request_contact': True}]],
             'resize_keyboard': True,
-            'one_time_keyboard': True,
+            'one_time_keyboard': False,
+            'is_persistent': True,
         },
     })
 
@@ -192,6 +197,31 @@ def quitar_registro_telefono(usuario_id):
     with sqlite3.connect(UPDATES_DB, timeout=5) as conexion:
         crear_tabla_telefonos(conexion)
         conexion.execute('DELETE FROM authorized_phones WHERE user_id = ?', (usuario_id,))
+
+
+def salir_del_bot(chat_id, usuario_id):
+    if usuario_id == MI_TELEGRAM_ID:
+        enviar_mensaje_telegram(
+            chat_id,
+            'Tu cuenta es la administradora y conserva su acceso por ID. '
+            'La opción de salida corresponde a los usuarios regulares.',
+            True,
+        )
+        return
+    quitar_registro_telefono(usuario_id)
+    llamar_telegram('sendMessage', {
+        'chat_id': chat_id,
+        'text': ('✅ Saliste del bot. Se eliminó el vínculo entre tu teléfono '
+                 'y tu cuenta de Telegram y se retiraron los controles de las sirenas. '
+                 'Para volver, pulsá 📱 Vincularme y compartí tu teléfono otra vez. '
+                 'Podrás ingresar si tu número sigue en la lista autorizada.'),
+        'reply_markup': {
+            'keyboard': [[{'text': '📱 Vincularme', 'request_contact': True}]],
+            'resize_keyboard': True,
+            'one_time_keyboard': False,
+            'is_persistent': True,
+        },
+    })
 
 
 def usuario_autorizado(usuario_id):
@@ -407,6 +437,12 @@ def webhook_telegram():
     try:
         if not reservar_update(update_id):
             return 'OK', 200
+        texto_salida = mensaje.get('text', '')
+        if (isinstance(texto_salida, str)
+                and texto_salida.strip().casefold() in ('/salir', 'salir', '🚪 salir del bot')):
+            # Eliminar el vínculo incluso si ya se retiró su número de la lista.
+            salir_del_bot(chat_id, remitente_id)
+            return 'OK', 200
         if 'contact' in mensaje and remitente_id != MI_TELEGRAM_ID:
             procesar_contacto(chat_id, remitente_id, mensaje)
             return 'OK', 200
@@ -420,7 +456,7 @@ def webhook_telegram():
     if not isinstance(texto, str):
         return 'OK', 200
     texto = texto.strip()
-    if texto == '/start':
+    if texto.casefold() in ('/start', '/vincularme', 'vincularme', '📱 vincularme'):
         if remitente_id == MI_TELEGRAM_ID:
             bienvenida = '🇨🇷 Control de sirenas. Primero usá /vincular y /confirmar para autorizar TuyaSmart. /escenas muestra los nombres sin activar nada.'
         else:
@@ -448,6 +484,34 @@ def webhook_telegram():
     return 'OK', 200
 
 
+def configurar_menu():
+    """Atajos visuales: el usuario toca una opción y Telegram envía el comando."""
+    operaciones = [
+        ('setMyCommands', {
+            'scope': {'type': 'default'},
+            'commands': [
+                {'command': 'vincularme', 'description': '📱 Vincularme'},
+                {'command': 'salir', 'description': '🚪 Salir del bot'},
+            ],
+        }),
+        ('setMyCommands', {
+            'scope': {'type': 'chat', 'chat_id': int(MI_TELEGRAM_ID)},
+            'commands': [
+                {'command': 'start', 'description': 'Panel de administración'},
+                {'command': 'vincular', 'description': 'Vincular TuyaSmart'},
+                {'command': 'confirmar', 'description': 'Confirmar vinculación de TuyaSmart'},
+                {'command': 'escenas', 'description': 'Consultar escenas sin activarlas'},
+            ],
+        }),
+        ('setChatMenuButton', {'menu_button': {'type': 'commands'}}),
+    ]
+    completo = True
+    for metodo, payload in operaciones:
+        exito, _ = llamar_telegram(metodo, payload)
+        completo = bool(exito) and completo
+    return completo
+
+
 def configurar_webhook():
     if not telegram_configurado():
         raise SystemExit('Revisá TELEGRAM_TOKEN, MI_TELEGRAM_ID y TELEGRAM_WEBHOOK_SECRET (32 a 256 caracteres: letras, números, _ o -). TELEFONOS_AUTORIZADOS debe contener teléfonos internacionales separados por comas.')
@@ -464,7 +528,10 @@ def configurar_webhook():
     })
     if not exito:
         raise SystemExit('No se pudo registrar el webhook. Revisá el token y la URL.')
-    print('Webhook registrado. Enviá /start al bot en un chat privado.')
+    if configurar_menu():
+        print('Webhook y menú registrados. En Telegram, abrí Menú y tocá Vincularme.')
+    else:
+        print('Webhook registrado. No se completó la actualización del menú; se puede reintentar configurar-webhook.')
 
 
 if __name__ == '__main__':
