@@ -154,7 +154,7 @@ def enviar_mensaje_telegram(chat_id, texto, mostrar_botones=False):
             'one_time_keyboard': False,
         }
     if mostrar_botones and str(chat_id) != MI_TELEGRAM_ID:
-        payload['reply_markup']['keyboard'].append([{'text': '🚪 Salir del bot'}])
+        payload['reply_markup']['keyboard'].append([{'text': '🚪 Desvincularme'}])
     return llamar_telegram('sendMessage', payload)
 
 
