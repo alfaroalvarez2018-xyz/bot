@@ -56,6 +56,8 @@ Solo la administración puede usar /vincular, /confirmar y /escenas.
 TELEGRAM_IDS_AUTORIZADOS ya no se utiliza; no permite saltarse la verificación.
 No usa TUYA_EMAIL, TUYA_PASSWORD, TUYA_API_KEY, TUYA_API_SECRET ni TUYA_HOME_ID.
 Ninguna orden se ejecuta automáticamente al vincular la cuenta.
+Los controles se muestran en dos filas, con estilos verde y rojo, y teclado de
+altura completa. El tamaño final y los colores dependen del cliente Telegram.
 """
 
 import hmac
@@ -144,8 +146,11 @@ def enviar_mensaje_telegram(chat_id, texto, mostrar_botones=False):
     payload = {'chat_id': chat_id, 'text': texto}
     if mostrar_botones:
         payload['reply_markup'] = {
-            'keyboard': [[{'text': '🟢 Encender Sirenas'}, {'text': '🔴 Apagar Sirenas'}]],
-            'resize_keyboard': True,
+            'keyboard': [
+                [{'text': '🟢 ENCENDER SIRENAS', 'style': 'success'}],
+                [{'text': '🔴 APAGAR SIRENAS', 'style': 'danger'}],
+            ],
+            'resize_keyboard': False,
             'one_time_keyboard': False,
         }
     return llamar_telegram('sendMessage', payload)
@@ -429,8 +434,8 @@ def webhook_telegram():
         confirmar_vinculacion(chat_id)
     elif texto == '/escenas':
         listar_escenas(chat_id)
-    elif texto in ('🟢 Encender Sirenas', '🔴 Apagar Sirenas'):
-        encender = texto == '🟢 Encender Sirenas'
+    elif texto.casefold() in ('🟢 encender sirenas', '🔴 apagar sirenas'):
+        encender = texto.casefold() == '🟢 encender sirenas'
         enviar_mensaje_telegram(chat_id, '⏳ Procesando la solicitud...')
         exito, detalle = conectar_y_ejecutar_escena(ESCENA_ENCENDER if encender else ESCENA_APAGAR)
         if exito:
