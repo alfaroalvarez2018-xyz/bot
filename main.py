@@ -12,13 +12,14 @@ requests==2.34.2
 tuya-device-sharing-sdk==0.2.15
 qrcode[pil]==8.2
 gunicorn==26.2.0
+cryptography
 
 Render / Start Command:
   gunicorn main:app --workers 1 --threads 1 --timeout 120
 
 Variables obligatorias en Render:
   TELEGRAM_TOKEN: token NUEVO de BotFather; no escribirlo en GitHub.
-  MI_TELEGRAM_ID: ID numérico del usuario autorizado, sin @.
+  MI_TELEGRAM_ID: tu ID numérico; sos la persona administradora del bot.
   TELEGRAM_WEBHOOK_SECRET: secreto aleatorio de 32 a 256 caracteres,
     solo letras ASCII, números, _ o -.
   TUYA_USER_CODE: TuyaSmart > Yo > Ajustes > Cuenta y seguridad > Código de usuario.
@@ -43,6 +44,16 @@ y configurar UPDATES_DB con una ruta dentro de ese disco. No usar varias réplic
 
 CONTROLAR_SECRET es opcional. Si no existe, /controlar queda deshabilitada.
 Si existe, Make/HTTP debe enviar Authorization: Bearer <CONTROLAR_SECRET>.
+TELEFONOS_AUTORIZADOS: lista de teléfonos internacionales separados por comas,
+por ejemplo +50688888888,+50687777777 (números ficticios). Incluir código de país.
+Cada persona abre el bot, envía /start y pulsa Compartir mi teléfono. El bot
+comprueba que el contacto pertenece a quien escribe y que su teléfono está en
+la lista. La vinculación teléfono-ID se guarda en SQLite; se consulta la lista
+en cada orden. Para revocar acceso, eliminar el teléfono y volver a desplegar.
+Si Render borra SQLite, las personas deben compartir su teléfono otra vez.
+MI_TELEGRAM_ID siempre autoriza a la persona administradora, incluso sin lista.
+Solo la administración puede usar /vincular, /confirmar y /escenas.
+TELEGRAM_IDS_AUTORIZADOS ya no se utiliza; no permite saltarse la verificación.
 No usa TUYA_EMAIL, TUYA_PASSWORD, TUYA_API_KEY, TUYA_API_SECRET ni TUYA_HOME_ID.
 Ninguna orden se ejecuta automáticamente al vincular la cuenta.
 """
@@ -73,6 +84,25 @@ def valor(nombre, defecto=''):
 
 TELEGRAM_TOKEN = valor('TELEGRAM_TOKEN')
 MI_TELEGRAM_ID = valor('MI_TELEGRAM_ID')
+
+
+def normalizar_telefono(numero):
+    """Formato internacional sin +; nunca adivinar un código de país."""
+    if not isinstance(numero, str):
+        return None
+    numero = numero.strip()
+    if not re.fullmatch(r'\+?[0-9 ()-]+', numero):
+        return None
+    digitos = re.sub(r'[ ()-]', '', numero).removeprefix('+')
+    return digitos if re.fullmatch(r'[1-9][0-9]{7,14}', digitos) else None
+
+
+TELEFONOS_CONFIG = [numero.strip()
+                    for numero in valor('TELEFONOS_AUTORIZADOS').split(',')
+                    if numero.strip()]
+TELEFONOS_NORMALIZADOS = [normalizar_telefono(numero) for numero in TELEFONOS_CONFIG]
+TELEFONOS_CONFIG_VALIDOS = all(numero is not None for numero in TELEFONOS_NORMALIZADOS)
+TELEFONOS_AUTORIZADOS = {numero for numero in TELEFONOS_NORMALIZADOS if numero}
 WEBHOOK_SECRET = valor('TELEGRAM_WEBHOOK_SECRET')
 CONTROLAR_SECRET = valor('CONTROLAR_SECRET')
 TUYA_USER_CODE = valor('TUYA_USER_CODE')
@@ -87,7 +117,8 @@ UPDATES_DB = valor('UPDATES_DB', '/tmp/sirenas_updates.sqlite3')
 
 
 def telegram_configurado():
-    return bool(TELEGRAM_TOKEN and MI_TELEGRAM_ID.isdigit()
+    return bool(TELEGRAM_TOKEN and re.fullmatch(r'[1-9][0-9]*', MI_TELEGRAM_ID)
+                and TELEFONOS_CONFIG_VALIDOS
                 and re.fullmatch(r'[A-Za-z0-9_-]{32,256}', WEBHOOK_SECRET))
 
 
@@ -118,6 +149,75 @@ def enviar_mensaje_telegram(chat_id, texto, mostrar_botones=False):
             'one_time_keyboard': False,
         }
     return llamar_telegram('sendMessage', payload)
+
+
+def solicitar_telefono(chat_id, texto=None):
+    return llamar_telegram('sendMessage', {
+        'chat_id': chat_id,
+        'text': texto or ('Para comprobar tu acceso, pulsá Compartir mi teléfono. '
+                         'El bot verificará tu número contra la lista autorizada '
+                         'y guardará su vínculo con tu cuenta de Telegram.'),
+        'reply_markup': {
+            'keyboard': [[{'text': '📱 Compartir mi teléfono', 'request_contact': True}]],
+            'resize_keyboard': True,
+            'one_time_keyboard': True,
+        },
+    })
+
+
+def crear_tabla_telefonos(conexion):
+    conexion.execute('''CREATE TABLE IF NOT EXISTS authorized_phones (
+        user_id TEXT PRIMARY KEY,
+        phone TEXT NOT NULL UNIQUE,
+        registered REAL NOT NULL
+    )''')
+
+
+def registrar_telefono(usuario_id, telefono):
+    with sqlite3.connect(UPDATES_DB, timeout=5) as conexion:
+        crear_tabla_telefonos(conexion)
+        # Si el número ahora pertenece a otra cuenta, retirar el vínculo anterior.
+        conexion.execute('DELETE FROM authorized_phones WHERE phone = ? AND user_id != ?',
+                         (telefono, usuario_id))
+        conexion.execute('INSERT OR REPLACE INTO authorized_phones VALUES (?, ?, ?)',
+                         (usuario_id, telefono, time.time()))
+
+
+def quitar_registro_telefono(usuario_id):
+    with sqlite3.connect(UPDATES_DB, timeout=5) as conexion:
+        crear_tabla_telefonos(conexion)
+        conexion.execute('DELETE FROM authorized_phones WHERE user_id = ?', (usuario_id,))
+
+
+def usuario_autorizado(usuario_id):
+    if usuario_id == MI_TELEGRAM_ID:
+        return True
+    with sqlite3.connect(UPDATES_DB, timeout=5) as conexion:
+        crear_tabla_telefonos(conexion)
+        fila = conexion.execute('SELECT phone FROM authorized_phones WHERE user_id = ?',
+                                (usuario_id,)).fetchone()
+    # Haber recibido botones o estar registrado no basta: revisar la lista actual.
+    return bool(fila and fila[0] in TELEFONOS_AUTORIZADOS)
+
+
+def procesar_contacto(chat_id, usuario_id, mensaje):
+    contacto = mensaje.get('contact')
+    if (not isinstance(contacto, dict)
+            or str(contacto.get('user_id')) != usuario_id
+            or mensaje.get('forward_origin') is not None
+            or mensaje.get('forward_date') is not None):
+        solicitar_telefono(chat_id, 'Compartí tu propio número usando el botón de abajo. No se aceptan contactos de otras personas ni mensajes reenviados.')
+        return
+    telefono = normalizar_telefono(contacto.get('phone_number'))
+    if not telefono:
+        solicitar_telefono(chat_id, 'No se pudo comprobar el número. Usá el botón para compartir tu propio teléfono.')
+        return
+    if telefono not in TELEFONOS_AUTORIZADOS:
+        quitar_registro_telefono(usuario_id)
+        solicitar_telefono(chat_id, 'Tu teléfono no está en la lista de personas autorizadas. Consultá con la persona administradora.')
+        return
+    registrar_telefono(usuario_id, telefono)
+    enviar_mensaje_telegram(chat_id, '✅ Teléfono verificado. Ya podés usar los botones para encender o apagar las sirenas.', True)
 
 
 def guardar_estado(nombre, contenido):
@@ -276,7 +376,7 @@ def controlar():
 @app.route('/webhook-telegram', methods=['POST'])
 def webhook_telegram():
     if not telegram_configurado():
-        return jsonify({'error': 'Revisá TELEGRAM_TOKEN, MI_TELEGRAM_ID y TELEGRAM_WEBHOOK_SECRET.'}), 503
+        return jsonify({'error': 'Revisá TELEGRAM_TOKEN, MI_TELEGRAM_ID, TELEGRAM_WEBHOOK_SECRET y TELEFONOS_AUTORIZADOS (teléfonos internacionales separados por comas).'}), 503
     recibido = request.headers.get('X-Telegram-Bot-Api-Secret-Token', '')
     if not hmac.compare_digest(recibido.encode('utf-8'), WEBHOOK_SECRET.encode('utf-8')):
         return 'Acceso denegado', 403
@@ -288,12 +388,13 @@ def webhook_telegram():
         return 'OK', 200
     chat = mensaje.get('chat', {})
     remitente = mensaje.get('from', {})
-    # Autoriza al remitente y exige chat privado, no un grupo compartido.
-    if str(remitente.get('id')) != MI_TELEGRAM_ID or chat.get('type') != 'private':
+    if not isinstance(chat, dict) or not isinstance(remitente, dict):
         return 'OK', 200
+    remitente_id = str(remitente.get('id'))
     chat_id = chat.get('id')
-    texto = mensaje.get('text', '')
-    if chat_id is None or not isinstance(texto, str):
+    if (chat.get('type') != 'private' or str(chat_id) != remitente_id
+            or not re.fullmatch(r'[1-9][0-9]*', remitente_id)
+            or remitente.get('is_bot') is True):
         return 'OK', 200
     update_id = datos.get('update_id')
     if type(update_id) is not int:
@@ -301,12 +402,27 @@ def webhook_telegram():
     try:
         if not reservar_update(update_id):
             return 'OK', 200
+        if 'contact' in mensaje and remitente_id != MI_TELEGRAM_ID:
+            procesar_contacto(chat_id, remitente_id, mensaje)
+            return 'OK', 200
+        if not usuario_autorizado(remitente_id):
+            solicitar_telefono(chat_id)
+            return 'OK', 200
     except sqlite3.Error:
-        app.logger.error('No se pudo registrar update_id; no se ejecutó la orden.')
+        app.logger.error('Error al comprobar acceso; no se ejecutó ninguna orden.')
         return 'Error temporal', 503
+    texto = mensaje.get('text', '')
+    if not isinstance(texto, str):
+        return 'OK', 200
     texto = texto.strip()
     if texto == '/start':
-        enviar_mensaje_telegram(chat_id, '🇨🇷 Control de sirenas. Primero usá /vincular y /confirmar para autorizar TuyaSmart. /escenas muestra los nombres sin activar nada.', True)
+        if remitente_id == MI_TELEGRAM_ID:
+            bienvenida = '🇨🇷 Control de sirenas. Primero usá /vincular y /confirmar para autorizar TuyaSmart. /escenas muestra los nombres sin activar nada.'
+        else:
+            bienvenida = '🇨🇷 Tenés acceso al control de sirenas. Usá los botones para encenderlas o apagarlas.'
+        enviar_mensaje_telegram(chat_id, bienvenida, True)
+    elif texto in ('/vincular', '/confirmar', '/escenas') and remitente_id != MI_TELEGRAM_ID:
+        enviar_mensaje_telegram(chat_id, 'Este comando está reservado a la persona administradora. Podés usar los botones para encender o apagar las sirenas.')
     elif texto == '/vincular':
         iniciar_vinculacion(chat_id)
     elif texto == '/confirmar':
@@ -329,7 +445,7 @@ def webhook_telegram():
 
 def configurar_webhook():
     if not telegram_configurado():
-        raise SystemExit('Configurá TELEGRAM_TOKEN, MI_TELEGRAM_ID y un TELEGRAM_WEBHOOK_SECRET de 32 a 256 caracteres (letras, números, _ o -).')
+        raise SystemExit('Revisá TELEGRAM_TOKEN, MI_TELEGRAM_ID y TELEGRAM_WEBHOOK_SECRET (32 a 256 caracteres: letras, números, _ o -). TELEFONOS_AUTORIZADOS debe contener teléfonos internacionales separados por comas.')
     base = valor('PUBLIC_BASE_URL').rstrip('/')
     if not base.startswith('https://'):
         raise SystemExit('PUBLIC_BASE_URL debe ser la URL HTTPS de tu servicio Render.')
