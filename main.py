@@ -56,6 +56,25 @@ Solo la administración puede usar /vincular, /confirmar y /escenas.
 TELEGRAM_IDS_AUTORIZADOS ya no se utiliza; no permite saltarse la verificación.
 No usa TUYA_EMAIL, TUYA_PASSWORD, TUYA_API_KEY, TUYA_API_SECRET ni TUYA_HOME_ID.
 Ninguna orden se ejecuta automáticamente al vincular la cuenta.
+REGISTRO_USUARIOS_JSON: objeto JSON privado indexado por teléfono internacional.
+Cada ficha: {"nombre": "María — Casa 12", "latitud": 10.0, "longitud": -84.0}.
+Solo es necesario el nombre. Las coordenadas antiguas se aceptan, pero no se usan.
+El mapa se obtiene exclusivamente del punto que la persona comparta en Telegram.
+La clave "admin" configura nombre/casa de la administración (no necesita contacto).
+Conservar TELEFONOS_AUTORIZADOS; agregar una ficha NO autoriza por sí solo.
+Tras un encendido aceptado por Tuya, se envía el aviso de inmediato al admin
+más las personas vinculadas que siguen autorizadas. Después se ofrece compartir
+la ubicación actual del teléfono de forma opcional durante 3 minutos.
+Compartir o rechazar la ubicación nunca ejecuta ni repite una escena.
+El mapa llega como complemento silencioso identificado por nombre y hora.
+Se rechazan ubicaciones reenviadas, continuas, vencidas o sin encendido pendiente.
+Telegram entrega un punto compartido, sin prueba criptográfica de su origen GPS.
+Al apagar se cierran todas las solicitudes pendientes; salir cierra la propia.
+La difusión corre en un hilo con cola SQLite, hasta tres intentos por destinatario,
+y descarta avisos de más de cinco minutos. Un timeout de Telegram puede duplicar
+un aviso, nunca repite la orden a Tuya. La entrega no está garantizada si bloquean
+el bot, no hay red, Render se duerme o se borra su disco temporal. Esta versión
+no incorpora aún una base de datos externa. No enviar teléfonos/coordenadas a GitHub.
 Los controles se muestran en dos filas, con estilos verde y rojo, y teclado de
 altura completa. El tamaño final y los colores dependen del cliente Telegram.
 """
@@ -64,6 +83,9 @@ import hmac
 import io
 import json
 import logging
+import math
+import threading
+from datetime import datetime, timedelta, timezone
 import os
 import re
 import sqlite3
@@ -105,6 +127,40 @@ TELEFONOS_CONFIG = [numero.strip()
 TELEFONOS_NORMALIZADOS = [normalizar_telefono(numero) for numero in TELEFONOS_CONFIG]
 TELEFONOS_CONFIG_VALIDOS = all(numero is not None for numero in TELEFONOS_NORMALIZADOS)
 TELEFONOS_AUTORIZADOS = {numero for numero in TELEFONOS_NORMALIZADOS if numero}
+# Registro privado en Render. No otorga permisos: se conserva la lista existente.
+# La clave "admin" permite asignar nombre y casa a MI_TELEGRAM_ID.
+def cargar_registro():
+    try:
+        datos = json.loads(valor('REGISTRO_USUARIOS_JSON', '{}'))
+        if not isinstance(datos, dict):
+            raise ValueError
+        registro = {}
+        for clave, ficha in datos.items():
+            telefono = 'admin' if clave == 'admin' else normalizar_telefono(clave)
+            if not telefono or telefono in registro or not isinstance(ficha, dict):
+                raise ValueError
+            nombre = ficha.get('nombre')
+            if not isinstance(nombre, str) or not nombre.strip() or len(nombre) > 120:
+                raise ValueError
+            if any(ord(c) < 32 for c in nombre):
+                raise ValueError
+            punto = {}
+            if 'latitud' in ficha or 'longitud' in ficha:
+                for campo, limite in (('latitud', 90), ('longitud', 180)):
+                    n = ficha.get(campo)
+                    if (type(n) not in (int, float) or not math.isfinite(n)
+                            or not -limite <= n <= limite):
+                        raise ValueError
+                    punto[campo] = n
+            registro[telefono] = {'nombre': nombre.strip(), **punto}
+        return registro
+    except (ValueError, TypeError):
+        # Nunca incluir teléfonos ni el contenido de la variable en los logs.
+        raise ValueError('Revisá REGISTRO_USUARIOS_JSON: JSON con nombres y pares de coordenadas válidos.') from None
+
+
+REGISTRO_USUARIOS = cargar_registro()
+
 WEBHOOK_SECRET = valor('TELEGRAM_WEBHOOK_SECRET')
 CONTROLAR_SECRET = valor('CONTROLAR_SECRET')
 TUYA_USER_CODE = valor('TUYA_USER_CODE')
@@ -154,7 +210,7 @@ def enviar_mensaje_telegram(chat_id, texto, mostrar_botones=False):
             'one_time_keyboard': False,
         }
     if mostrar_botones and str(chat_id) != MI_TELEGRAM_ID:
-        payload['reply_markup']['keyboard'].append([{'text': '🚪 Desvincularme'}])
+        payload['reply_markup']['keyboard'].append([{'text': '🚪 Salir del bot'}])
     return llamar_telegram('sendMessage', payload)
 
 
@@ -164,7 +220,7 @@ def solicitar_telefono(chat_id, texto=None):
         'text': texto or ('Para ingresar, pulsá 📱 Vincularme y aceptá compartir '
                          'el teléfono de tu cuenta de Telegram. El bot verificará '
                          'tu número contra la lista autorizada y guardará su vínculo '
-                         'con tu cuenta. Si el botón está oculto, tocá el ícono de '
+                         'con tu cuenta. Al encender, tu nombre asignado se compartirá con las personas autorizadas vinculadas. Después podrás compartir tu ubicación de forma opcional. Si el botón está oculto, tocá el ícono de '
                          'teclado o cuadrícula junto al campo de mensajes.'),
         'reply_markup': {
             'keyboard': [[{'text': '📱 Vincularme', 'request_contact': True}]],
@@ -209,6 +265,7 @@ def salir_del_bot(chat_id, usuario_id):
         )
         return
     quitar_registro_telefono(usuario_id)
+    descartar_ubicacion(usuario_id)
     llamar_telegram('sendMessage', {
         'chat_id': chat_id,
         'text': ('✅ Saliste del bot. Se eliminó el vínculo entre tu teléfono '
@@ -233,6 +290,210 @@ def usuario_autorizado(usuario_id):
                                 (usuario_id,)).fetchone()
     # Haber recibido botones o estar registrado no basta: revisar la lista actual.
     return bool(fila and fila[0] in TELEFONOS_AUTORIZADOS)
+
+
+def ficha_usuario(usuario_id):
+    if usuario_id == MI_TELEGRAM_ID:
+        return REGISTRO_USUARIOS.get('admin', {'nombre': 'La administración'})
+    with sqlite3.connect(UPDATES_DB, timeout=5) as conexion:
+        crear_tabla_telefonos(conexion)
+        fila = conexion.execute('SELECT phone FROM authorized_phones WHERE user_id = ?',
+                                (usuario_id,)).fetchone()
+    # No recurrir al nombre de Telegram, ni exponer el teléfono como alternativa.
+    return REGISTRO_USUARIOS.get(fila[0], {'nombre': 'Una persona autorizada'}) if fila else {'nombre': 'Una persona autorizada'}
+
+
+def crear_tabla_avisos(conexion):
+    conexion.execute("""CREATE TABLE IF NOT EXISTS pending_alerts (
+        id INTEGER PRIMARY KEY, event_id INTEGER NOT NULL,
+        user_id TEXT NOT NULL, phone TEXT, payload TEXT NOT NULL,
+        created REAL NOT NULL, next_attempt REAL NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        UNIQUE(event_id, user_id)
+    )""")
+
+
+_worker_lock = threading.Lock()
+_worker_thread = None
+
+
+def encolar_para_autorizados(conexion, event_id, payload):
+    ahora = time.time()
+    crear_tabla_telefonos(conexion)
+    crear_tabla_avisos(conexion)
+    destinatarios = {MI_TELEGRAM_ID: None}
+    for uid, telefono in conexion.execute('SELECT user_id, phone FROM authorized_phones'):
+        if telefono in TELEFONOS_AUTORIZADOS and uid != MI_TELEGRAM_ID:
+            destinatarios[uid] = telefono
+    for uid, telefono in destinatarios.items():
+        conexion.execute("""INSERT OR IGNORE INTO pending_alerts
+            (event_id, user_id, phone, payload, created, next_attempt)
+            VALUES (?, ?, ?, ?, ?, ?)""",
+            (event_id, uid, telefono, json.dumps(payload), ahora, ahora))
+
+
+def fecha_costa_rica(instante):
+    return datetime.fromtimestamp(instante, timezone(timedelta(hours=-6))).strftime('%d/%m/%Y %H:%M:%S')
+
+
+def encolar_aviso_encendido(usuario_id, update_id):
+    ficha = ficha_usuario(usuario_id)
+    fecha = fecha_costa_rica(time.time())
+    texto = (f'🚨 {ficha["nombre"]} envió la orden de encender las sirenas, '
+             'revisa el "Grupo Organizado Trinidad" en WhatsApp.'
+             f'\n\n🕒 {fecha} (Costa Rica).'
+             '\nTuya aceptó la orden; esto no confirma que las sirenas estén sonando.')
+    # Este aviso sale sin esperar ubicación y nunca incluye la antigua casa fija.
+    with sqlite3.connect(UPDATES_DB, timeout=5) as conexion:
+        encolar_para_autorizados(conexion, update_id, {'text': texto, 'disable_notification': False})
+    iniciar_worker_avisos()
+
+
+def crear_tabla_ubicaciones(conexion):
+    conexion.execute("""CREATE TABLE IF NOT EXISTS pending_locations (
+        user_id TEXT PRIMARY KEY, event_id INTEGER NOT NULL,
+        phone TEXT, nombre TEXT NOT NULL, created REAL NOT NULL
+    )""")
+
+
+def descartar_ubicacion(usuario_id=None):
+    with sqlite3.connect(UPDATES_DB, timeout=5) as conexion:
+        crear_tabla_ubicaciones(conexion)
+        if usuario_id is None:
+            conexion.execute('DELETE FROM pending_locations')
+        else:
+            conexion.execute('DELETE FROM pending_locations WHERE user_id = ?', (usuario_id,))
+
+
+def solicitar_ubicacion_opcional(chat_id, usuario_id, update_id):
+    ficha = ficha_usuario(usuario_id)
+    with sqlite3.connect(UPDATES_DB, timeout=5) as conexion:
+        crear_tabla_ubicaciones(conexion)
+        crear_tabla_telefonos(conexion)
+        fila = conexion.execute('SELECT phone FROM authorized_phones WHERE user_id = ?',
+                                (usuario_id,)).fetchone()
+        telefono = fila[0] if fila and usuario_id != MI_TELEGRAM_ID else None
+        conexion.execute('INSERT OR REPLACE INTO pending_locations VALUES (?, ?, ?, ?, ?)',
+                         (usuario_id, update_id, telefono, ficha['nombre'], time.time()))
+    llamar_telegram('sendMessage', {
+        'chat_id': chat_id,
+        'text': ('📍 Compartir tu ubicación es opcional. La orden de encendido ya fue '
+                 'aceptada por Tuya y el aviso se está enviando. Si querés agregar '
+                 'el punto donde estás, pulsá el botón y aceptá compartir tu ubicación '
+                 'actual en Telegram. Se enviará a la administración y a las personas '
+                 'vinculadas y autorizadas. Tenés 3 minutos. También podés continuar '
+                 'sin ubicación; esto no cambia la orden enviada.'),
+        'reply_markup': {
+            'keyboard': [
+                [{'text': '📍 Compartir mi ubicación', 'request_location': True}],
+                [{'text': '⏭️ Continuar sin ubicación'}],
+                [{'text': '🔴 APAGAR SIRENAS', 'style': 'danger'}],
+            ],
+            'resize_keyboard': False, 'one_time_keyboard': False, 'is_persistent': True,
+        },
+    })
+
+
+def procesar_ubicacion(chat_id, usuario_id, mensaje):
+    """Solo agrega un mapa a un encendido reciente. Nunca ejecuta escenas."""
+    punto = mensaje.get('location')
+    if (not isinstance(punto, dict) or mensaje.get('forward_origin') is not None
+            or mensaje.get('forward_date') is not None or punto.get('live_period') is not None):
+        enviar_mensaje_telegram(chat_id, 'Usá el botón para compartir una ubicación puntual, sin reenviar mensajes. Compartirla es opcional y no modifica las sirenas.')
+        return
+    lat, lon = punto.get('latitude'), punto.get('longitude')
+    if any(type(n) not in (int, float) or not math.isfinite(n) or not -limite <= n <= limite
+           for n, limite in ((lat, 90), (lon, 180))):
+        enviar_mensaje_telegram(chat_id, 'No se pudo leer el punto. Podés continuar sin ubicación; la orden enviada no cambia.')
+        return
+    with sqlite3.connect(UPDATES_DB, timeout=5) as conexion:
+        crear_tabla_ubicaciones(conexion)
+        crear_tabla_telefonos(conexion)
+        # Consumo y cola en una transacción: un punto no se difunde dos veces.
+        conexion.execute('BEGIN IMMEDIATE')
+        fila = conexion.execute('SELECT event_id, phone, nombre, created FROM pending_locations WHERE user_id = ?',
+                                (usuario_id,)).fetchone()
+        activo = bool(fila and 0 <= time.time() - fila[3] <= 180)
+        if activo and usuario_id != MI_TELEGRAM_ID:
+            vinculo = conexion.execute('SELECT phone FROM authorized_phones WHERE user_id = ?', (usuario_id,)).fetchone()
+            activo = bool(vinculo and vinculo[0] == fila[1] and fila[1] in TELEFONOS_AUTORIZADOS)
+        if activo:
+            event_id, _, nombre, fecha = fila
+            texto = (f'📍 Ubicación compartida por {nombre} para su orden de encendido '
+                     f'del {fecha_costa_rica(fecha)} (Costa Rica).'
+                     '\nEs el punto que compartió en Telegram; puede ser distinto de su casa.'
+                     '\nEste mensaje no envía otra orden a las sirenas.')
+            payload = {
+                'text': texto, 'disable_notification': True,
+                'reply_markup': {'inline_keyboard': [[{
+                    'text': '📍 Abrir ubicación en Google Maps',
+                    'url': f'https://www.google.com/maps/search/?api=1&query={lat}%2C{lon}',
+                }]]},
+                'punto': {'latitude': lat, 'longitude': lon},
+            }
+            # IDs de encendido no negativos; negativos separan su complemento de mapa.
+            encolar_para_autorizados(conexion, -event_id - 1, payload)
+        conexion.execute('DELETE FROM pending_locations WHERE user_id = ?', (usuario_id,))
+    if activo:
+        iniciar_worker_avisos()
+        enviar_mensaje_telegram(chat_id, '✅ Tu ubicación quedó preparada para enviarse a las personas autorizadas. No se ejecutó otra orden.', True)
+    else:
+        enviar_mensaje_telegram(chat_id, 'No hay una solicitud de ubicación vigente. Las solicitudes duran 3 minutos y se cierran al apagar o continuar sin ubicación. Este punto no se compartió y no cambió las sirenas.', True)
+
+
+def entregar_aviso_pendiente():
+    """Un intento por llamada; los avisos nunca vuelven a ejecutar una escena."""
+    ahora = time.time()
+    with sqlite3.connect(UPDATES_DB, timeout=5) as conexion:
+        crear_tabla_avisos(conexion)
+        # No repartir alertas antiguas como si acabaran de ocurrir.
+        conexion.execute('DELETE FROM pending_alerts WHERE created < ?', (ahora - 300,))
+        fila = conexion.execute("""SELECT id, user_id, phone, payload, attempts
+            FROM pending_alerts WHERE next_attempt <= ? ORDER BY id LIMIT 1""", (ahora,)).fetchone()
+    if not fila:
+        return False
+    aviso_id, uid, telefono, contenido, intentos = fila
+    autorizado = uid == MI_TELEGRAM_ID
+    if not autorizado and telefono in TELEFONOS_AUTORIZADOS:
+        with sqlite3.connect(UPDATES_DB, timeout=5) as conexion:
+            crear_tabla_telefonos(conexion)
+            vinculo = conexion.execute('SELECT phone FROM authorized_phones WHERE user_id = ?', (uid,)).fetchone()
+        autorizado = bool(vinculo and vinculo[0] == telefono)
+    payload = json.loads(contenido)
+    punto = payload.pop('punto', None)
+    exito = True
+    if autorizado:
+        exito, _ = llamar_telegram('sendMessage', {'chat_id': uid, **payload})
+        if exito and punto:
+            # El texto ya tiene enlace al punto si esta segunda llamada falla.
+            llamar_telegram('sendLocation', {'chat_id': uid, **punto, 'disable_notification': True})
+    with sqlite3.connect(UPDATES_DB, timeout=5) as conexion:
+        if exito or intentos >= 2:
+            conexion.execute('DELETE FROM pending_alerts WHERE id = ?', (aviso_id,))
+            if not exito:
+                app.logger.warning('No se pudo entregar un aviso después de tres intentos.')
+        else:
+            conexion.execute('UPDATE pending_alerts SET attempts = attempts + 1, next_attempt = ? WHERE id = ?',
+                             (time.time() + 30 * (intentos + 1), aviso_id))
+    return True
+
+
+def worker_avisos():
+    while True:
+        try:
+            enviado = entregar_aviso_pendiente()
+        except Exception:
+            app.logger.error('Error temporal al repartir avisos; no se repiten órdenes a Tuya.')
+            enviado = False
+        time.sleep(0.12 if enviado else 5)
+
+
+def iniciar_worker_avisos():
+    global _worker_thread
+    with _worker_lock:
+        if _worker_thread is None or not _worker_thread.is_alive():
+            _worker_thread = threading.Thread(target=worker_avisos, daemon=True, name='avisos-sirenas')
+            _worker_thread.start()
 
 
 def procesar_contacto(chat_id, usuario_id, mensaje):
@@ -432,14 +693,14 @@ def webhook_telegram():
             or remitente.get('is_bot') is True):
         return 'OK', 200
     update_id = datos.get('update_id')
-    if type(update_id) is not int:
+    if type(update_id) is not int or update_id < 0:
         return 'Falta update_id', 400
     try:
         if not reservar_update(update_id):
             return 'OK', 200
         texto_salida = mensaje.get('text', '')
         if (isinstance(texto_salida, str)
-                and texto_salida.strip().casefold() in ('/salir', 'salir', '🚪 salir del bot')):
+                and texto_salida.strip().casefold() in ('/salir', 'salir', '🚪 salir del bot', '🚪 desvincularme', 'desvincularme')):
             # Eliminar el vínculo incluso si ya se retiró su número de la lista.
             salir_del_bot(chat_id, remitente_id)
             return 'OK', 200
@@ -447,7 +708,11 @@ def webhook_telegram():
             procesar_contacto(chat_id, remitente_id, mensaje)
             return 'OK', 200
         if not usuario_autorizado(remitente_id):
+            descartar_ubicacion(remitente_id)
             solicitar_telefono(chat_id)
+            return 'OK', 200
+        if 'location' in mensaje:
+            procesar_ubicacion(chat_id, remitente_id, mensaje)
             return 'OK', 200
     except sqlite3.Error:
         app.logger.error('Error al comprobar acceso; no se ejecutó ninguna orden.')
@@ -456,7 +721,10 @@ def webhook_telegram():
     if not isinstance(texto, str):
         return 'OK', 200
     texto = texto.strip()
-    if texto.casefold() in ('/start', '/vincularme', 'vincularme', '📱 vincularme'):
+    if texto.casefold() in ('⏭️ continuar sin ubicación', '/sinubicacion'):
+        descartar_ubicacion(remitente_id)
+        enviar_mensaje_telegram(chat_id, 'Continuás sin compartir ubicación. La orden que ya enviaste no cambia.', True)
+    elif texto.casefold() in ('/start', '/vincularme', 'vincularme', '📱 vincularme'):
         if remitente_id == MI_TELEGRAM_ID:
             bienvenida = '🇨🇷 Control de sirenas. Primero usá /vincular y /confirmar para autorizar TuyaSmart. /escenas muestra los nombres sin activar nada.'
         else:
@@ -477,6 +745,20 @@ def webhook_telegram():
         if exito:
             accion = 'encendido' if encender else 'apagado'
             enviar_mensaje_telegram(chat_id, f'✅ Tuya aceptó la orden de {accion}. Verificá el estado de las sirenas.')
+            if encender:
+                try:
+                    encolar_aviso_encendido(remitente_id, update_id)
+                except Exception:
+                    app.logger.error('Tuya aceptó la orden, pero no se pudo preparar el aviso.')
+                    enviar_mensaje_telegram(chat_id, '⚠️ La orden fue aceptada, pero no se pudo preparar el aviso a los demás. No repitás el encendido solo por este fallo.')
+                try:
+                    solicitar_ubicacion_opcional(chat_id, remitente_id, update_id)
+                except Exception:
+                    app.logger.error('No se pudo ofrecer la ubicación opcional; la orden ya fue aceptada.')
+                    enviar_mensaje_telegram(chat_id, 'No se pudo ofrecer la ubicación opcional. La orden ya fue aceptada; no necesitás repetirla.', True)
+            else:
+                # Una orden de apagado cierra las solicitudes de ubicación de todos.
+                descartar_ubicacion()
         else:
             enviar_mensaje_telegram(chat_id, f'❌ {detalle}')
     else:
@@ -534,8 +816,15 @@ def configurar_webhook():
         print('Webhook registrado. No se completó la actualización del menú; se puede reintentar configurar-webhook.')
 
 
+# Reanudar avisos pendientes tras un reinicio si SQLite se conserva. Un solo worker/réplica.
+if __name__ != '__main__' and telegram_configurado():
+    iniciar_worker_avisos()
+
+
 if __name__ == '__main__':
     if len(sys.argv) == 2 and sys.argv[1] == 'configurar-webhook':
         configurar_webhook()
     else:
+        if telegram_configurado():
+            iniciar_worker_avisos()
         app.run(host='0.0.0.0', port=int(valor('PORT', '8080')))
