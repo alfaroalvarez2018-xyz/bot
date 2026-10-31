@@ -342,7 +342,7 @@ def encolar_aviso_encendido(usuario_id, update_id):
     texto = (f'🚨 {ficha["nombre"]} envió la orden de encender las sirenas, '
              'revisa el "Grupo Organizado Trinidad" en WhatsApp.'
              f'\n\n🕒 {fecha} (Costa Rica).'
-             '\nTuya aceptó la orden; esto no confirma que las sirenas estén sonando.')
+             '\nConfirma que las sirenas estén sonando.')
     # Este aviso sale sin esperar ubicación y nunca incluye la antigua casa fija.
     with sqlite3.connect(UPDATES_DB, timeout=5) as conexion:
         encolar_para_autorizados(conexion, update_id, {'text': texto, 'disable_notification': False})
@@ -385,7 +385,7 @@ def solicitar_ubicacion_opcional(chat_id, usuario_id, update_id):
                  'sin ubicación; esto no cambia la orden enviada.'),
         'reply_markup': {
             'keyboard': [
-                [{'text': '📍 Compartir mi ubicación', 'request_location': True}],
+                [{'text': '📍 Compartir Ubicación (Recomendado)', 'request_location': True}],
                 [{'text': '⏭️ Continuar sin ubicación'}],
                 [{'text': '🔴 APAGAR SIRENAS', 'style': 'danger'}],
             ],
