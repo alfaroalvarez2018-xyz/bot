@@ -70,6 +70,10 @@ El mapa llega como complemento silencioso identificado por nombre y hora.
 Se rechazan ubicaciones reenviadas, continuas, vencidas o sin encendido pendiente.
 Telegram entrega un punto compartido, sin prueba criptográfica de su origen GPS.
 Al apagar se cierran todas las solicitudes pendientes; salir cierra la propia.
+Al vencer el plazo o apagar, se encola una actualización silenciosa del teclado
+de cada persona afectada. El hilo de avisos retira el botón de ubicación y
+restaura los controles mientras el servicio está activo y Telegram responde.
+Un cierre anterior no reemplaza el teclado de una solicitud más reciente.
 La difusión corre en un hilo con cola SQLite, hasta tres intentos por destinatario,
 y descarta avisos de más de cinco minutos. Un timeout de Telegram puede duplicar
 un aviso, nunca repite la orden a Tuya. La entrega no está garantizada si bloquean
@@ -198,19 +202,24 @@ def llamar_telegram(metodo, payload):
         return False, 'No se pudo comunicar con Telegram.'
 
 
+def teclado_sirenas(chat_id):
+    teclado = {
+        'keyboard': [
+            [{'text': '🟢 ENCENDER SIRENAS', 'style': 'success'}],
+            [{'text': '🔴 APAGAR SIRENAS', 'style': 'danger'}],
+        ],
+        'resize_keyboard': False,
+        'one_time_keyboard': False,
+    }
+    if str(chat_id) != MI_TELEGRAM_ID:
+        teclado['keyboard'].append([{'text': '🚪 Desvincularme'}])
+    return teclado
+
+
 def enviar_mensaje_telegram(chat_id, texto, mostrar_botones=False):
     payload = {'chat_id': chat_id, 'text': texto}
     if mostrar_botones:
-        payload['reply_markup'] = {
-            'keyboard': [
-                [{'text': '🟢 ENCENDER SIRENAS', 'style': 'success'}],
-                [{'text': '🔴 APAGAR SIRENAS', 'style': 'danger'}],
-            ],
-            'resize_keyboard': False,
-            'one_time_keyboard': False,
-        }
-    if mostrar_botones and str(chat_id) != MI_TELEGRAM_ID:
-        payload['reply_markup']['keyboard'].append([{'text': '🚪 Desvincularme'}])
+        payload['reply_markup'] = teclado_sirenas(chat_id)
     return llamar_telegram('sendMessage', payload)
 
 
@@ -315,6 +324,7 @@ def crear_tabla_avisos(conexion):
 
 _worker_lock = threading.Lock()
 _worker_thread = None
+_ubicacion_ui_lock = threading.RLock()
 
 
 def encolar_para_autorizados(conexion, event_id, payload):
@@ -356,16 +366,56 @@ def crear_tabla_ubicaciones(conexion):
     )""")
 
 
-def descartar_ubicacion(usuario_id=None):
+def encolar_retiro_boton(conexion, fila, texto):
+    uid, event_id, telefono = fila
+    crear_tabla_avisos(conexion)
+    ahora = time.time()
+    payload = {'text': texto, 'disable_notification': True,
+               'reply_markup': teclado_sirenas(uid), 'restaurar_controles': True}
+    # Un encendido produce mapa O cierre, nunca ambos: comparten su clave de cola.
+    conexion.execute('''INSERT OR IGNORE INTO pending_alerts
+        (event_id, user_id, phone, payload, created, next_attempt)
+        VALUES (?, ?, ?, ?, ?, ?)''',
+        (-event_id - 1, uid, telefono, json.dumps(payload), ahora, ahora))
+
+
+def descartar_ubicacion(usuario_id=None, aviso=None, excepto=None):
     with sqlite3.connect(UPDATES_DB, timeout=5) as conexion:
         crear_tabla_ubicaciones(conexion)
+        conexion.execute('BEGIN IMMEDIATE')
+        filas = conexion.execute('SELECT user_id, event_id, phone FROM pending_locations'
+                                 + (' WHERE user_id = ?' if usuario_id is not None else ''),
+                                 (usuario_id,) if usuario_id is not None else ()).fetchall()
+        if aviso:
+            for fila in filas:
+                if fila[0] != excepto:
+                    encolar_retiro_boton(conexion, fila, aviso)
         if usuario_id is None:
             conexion.execute('DELETE FROM pending_locations')
         else:
             conexion.execute('DELETE FROM pending_locations WHERE user_id = ?', (usuario_id,))
 
 
+def cerrar_ubicaciones_vencidas():
+    with sqlite3.connect(UPDATES_DB, timeout=5) as conexion:
+        crear_tabla_ubicaciones(conexion)
+        conexion.execute('BEGIN IMMEDIATE')
+        filas = conexion.execute('SELECT user_id, event_id, phone FROM pending_locations WHERE created < ?',
+                                 (time.time() - 180,)).fetchall()
+        for fila in filas:
+            encolar_retiro_boton(conexion, fila,
+                '⌛ Terminó el plazo de 3 minutos para compartir ubicación. '
+                'Retiré ese botón y volví a mostrar los controles. La orden de las sirenas no cambia.')
+            conexion.execute('DELETE FROM pending_locations WHERE user_id = ?', (fila[0],))
+
+
 def solicitar_ubicacion_opcional(chat_id, usuario_id, update_id):
+    # Evita que un aviso de cierre anterior reemplace este teclado nuevo.
+    with _ubicacion_ui_lock:
+        _solicitar_ubicacion_opcional(chat_id, usuario_id, update_id)
+
+
+def _solicitar_ubicacion_opcional(chat_id, usuario_id, update_id):
     ficha = ficha_usuario(usuario_id)
     with sqlite3.connect(UPDATES_DB, timeout=5) as conexion:
         crear_tabla_ubicaciones(conexion)
@@ -382,7 +432,8 @@ def solicitar_ubicacion_opcional(chat_id, usuario_id, update_id):
                  'el punto donde estás, pulsá el botón y aceptá compartir tu ubicación '
                  'actual en Telegram. Se enviará a la administración y a las personas '
                  'vinculadas y autorizadas. Tenés 3 minutos. También podés continuar '
-                 'sin ubicación; esto no cambia la orden enviada.'),
+                 'sin ubicación; esto no cambia la orden enviada. Al terminar '
+                 'el plazo o apagar, el bot retirará este botón y mostrará los controles.'),
         'reply_markup': {
             'keyboard': [
                 [{'text': '📍 Compartir Ubicación (Recomendado)', 'request_location': True}],
@@ -438,7 +489,7 @@ def procesar_ubicacion(chat_id, usuario_id, mensaje):
         iniciar_worker_avisos()
         enviar_mensaje_telegram(chat_id, '✅ Tu ubicación quedó preparada para enviarse a las personas autorizadas. No se ejecutó otra orden.', True)
     else:
-        enviar_mensaje_telegram(chat_id, 'No hay una solicitud de ubicación vigente. Las solicitudes duran 3 minutos y se cierran al apagar o continuar sin ubicación. Este punto no se compartió y no cambió las sirenas.', True)
+        enviar_mensaje_telegram(chat_id, 'La opción de compartir ubicación ya terminó. Retiré ese botón y volví a mostrar los controles. Este punto no se compartió y no cambió las sirenas.', True)
 
 
 def entregar_aviso_pendiente():
@@ -461,9 +512,19 @@ def entregar_aviso_pendiente():
         autorizado = bool(vinculo and vinculo[0] == telefono)
     payload = json.loads(contenido)
     punto = payload.pop('punto', None)
+    restaurar = payload.pop('restaurar_controles', False)
     exito = True
     if autorizado:
-        exito, _ = llamar_telegram('sendMessage', {'chat_id': uid, **payload})
+        if restaurar:
+            with _ubicacion_ui_lock:
+                with sqlite3.connect(UPDATES_DB, timeout=5) as conexion:
+                    crear_tabla_ubicaciones(conexion)
+                    nueva = conexion.execute('SELECT 1 FROM pending_locations WHERE user_id = ?', (uid,)).fetchone()
+                # No ocultar el botón de una solicitud más reciente.
+                if not nueva:
+                    exito, _ = llamar_telegram('sendMessage', {'chat_id': uid, **payload})
+        else:
+            exito, _ = llamar_telegram('sendMessage', {'chat_id': uid, **payload})
         if exito and punto:
             # El texto ya tiene enlace al punto si esta segunda llamada falla.
             llamar_telegram('sendLocation', {'chat_id': uid, **punto, 'disable_notification': True})
@@ -481,6 +542,7 @@ def entregar_aviso_pendiente():
 def worker_avisos():
     while True:
         try:
+            cerrar_ubicaciones_vencidas()
             enviado = entregar_aviso_pendiente()
         except Exception:
             app.logger.error('Error temporal al repartir avisos; no se repiten órdenes a Tuya.')
@@ -744,7 +806,7 @@ def webhook_telegram():
         exito, detalle = conectar_y_ejecutar_escena(ESCENA_ENCENDER if encender else ESCENA_APAGAR)
         if exito:
             accion = 'encendido' if encender else 'apagado'
-            enviar_mensaje_telegram(chat_id, f'✅ Tuya aceptó la orden de {accion}. Verificá el estado de las sirenas.')
+            enviar_mensaje_telegram(chat_id, f'✅ Tuya aceptó la orden de {accion}. Verificá el estado de las sirenas.', not encender)
             if encender:
                 try:
                     encolar_aviso_encendido(remitente_id, update_id)
@@ -758,7 +820,8 @@ def webhook_telegram():
                     enviar_mensaje_telegram(chat_id, 'No se pudo ofrecer la ubicación opcional. La orden ya fue aceptada; no necesitás repetirla.', True)
             else:
                 # Una orden de apagado cierra las solicitudes de ubicación de todos.
-                descartar_ubicacion()
+                descartar_ubicacion(aviso='ℹ️ Tuya aceptó una orden de apagado. Se cerró la opción de compartir ubicación y volví a mostrar los controles.', excepto=remitente_id)
+                iniciar_worker_avisos()
         else:
             enviar_mensaje_telegram(chat_id, f'❌ {detalle}')
     else:
