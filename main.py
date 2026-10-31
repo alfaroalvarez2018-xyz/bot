@@ -223,7 +223,7 @@ def solicitar_telefono(chat_id, texto=None):
                          'con tu cuenta. Al encender, tu nombre asignado se compartirá con las personas autorizadas vinculadas. Después podrás compartir tu ubicación de forma opcional. Si el botón está oculto, tocá el ícono de '
                          'teclado o cuadrícula junto al campo de mensajes.'),
         'reply_markup': {
-            'keyboard': [[{'text': '📱 Vincularme', 'request_contact': True}]],
+            'keyboard': [[{'text': '📱 Vincularme', 'request_contact': True, 'style': 'success',}]],
             'resize_keyboard': True,
             'one_time_keyboard': False,
             'is_persistent': True,
