@@ -74,6 +74,8 @@ Al vencer el plazo o apagar, se encola una actualización silenciosa del teclado
 de cada persona afectada. El hilo de avisos retira el botón de ubicación y
 restaura los controles mientras el servicio está activo y Telegram responde.
 Un cierre anterior no reemplaza el teclado de una solicitud más reciente.
+Las conexiones SQLite se cierran siempre y las operaciones locales se serializan.
+Los fallos de acceso previos a una orden permiten reintentar ese mensaje.
 La difusión corre en un hilo con cola SQLite, hasta tres intentos por destinatario,
 y descarta avisos de más de cinco minutos. Un timeout de Telegram puede duplicar
 un aviso, nunca repite la orden a Tuya. La entrega no está garantizada si bloquean
@@ -84,6 +86,7 @@ altura completa. El tamaño final y los colores dependen del cliente Telegram.
 """
 
 import hmac
+from contextlib import contextmanager
 import io
 import json
 import logging
@@ -178,6 +181,37 @@ ESCENA_APAGAR = valor('ESCENA_APAGAR', 'Apagar_Sirenas')
 UPDATES_DB = valor('UPDATES_DB', '/tmp/sirenas_updates.sqlite3')
 
 
+_db_lock = threading.RLock()
+
+
+@contextmanager
+def conexion_db():
+    """Transacciones cortas, sin red, serializadas dentro de este proceso.
+
+    El contexto original de sqlite3 confirma/revierte, pero NO cierra la conexión.
+    Cerrar siempre evita acumular conexiones y recursos en el hilo de avisos.
+    No borra ni sustituye una base existente.
+    """
+    with _db_lock:
+        conexion = sqlite3.connect(UPDATES_DB, timeout=5,
+                                   isolation_level='DEFERRED',
+                                   autocommit=sqlite3.LEGACY_TRANSACTION_CONTROL)
+        try:
+            yield conexion
+            conexion.commit()
+        except BaseException:
+            conexion.rollback()
+            raise
+        finally:
+            conexion.close()
+
+
+def registrar_error_db(contexto, exc):
+    app.logger.error('SQLite en %s: %s / %s. No se registran teléfonos ni credenciales.',
+                     contexto, type(exc).__name__,
+                     getattr(exc, 'sqlite_errorname', 'SIN_CODIGO'))
+
+
 def telegram_configurado():
     return bool(TELEGRAM_TOKEN and re.fullmatch(r'[1-9][0-9]*', MI_TELEGRAM_ID)
                 and TELEFONOS_CONFIG_VALIDOS
@@ -249,7 +283,7 @@ def crear_tabla_telefonos(conexion):
 
 
 def registrar_telefono(usuario_id, telefono):
-    with sqlite3.connect(UPDATES_DB, timeout=5) as conexion:
+    with conexion_db() as conexion:
         crear_tabla_telefonos(conexion)
         # Si el número ahora pertenece a otra cuenta, retirar el vínculo anterior.
         conexion.execute('DELETE FROM authorized_phones WHERE phone = ? AND user_id != ?',
@@ -259,7 +293,7 @@ def registrar_telefono(usuario_id, telefono):
 
 
 def quitar_registro_telefono(usuario_id):
-    with sqlite3.connect(UPDATES_DB, timeout=5) as conexion:
+    with conexion_db() as conexion:
         crear_tabla_telefonos(conexion)
         conexion.execute('DELETE FROM authorized_phones WHERE user_id = ?', (usuario_id,))
 
@@ -293,7 +327,7 @@ def salir_del_bot(chat_id, usuario_id):
 def usuario_autorizado(usuario_id):
     if usuario_id == MI_TELEGRAM_ID:
         return True
-    with sqlite3.connect(UPDATES_DB, timeout=5) as conexion:
+    with conexion_db() as conexion:
         crear_tabla_telefonos(conexion)
         fila = conexion.execute('SELECT phone FROM authorized_phones WHERE user_id = ?',
                                 (usuario_id,)).fetchone()
@@ -304,7 +338,7 @@ def usuario_autorizado(usuario_id):
 def ficha_usuario(usuario_id):
     if usuario_id == MI_TELEGRAM_ID:
         return REGISTRO_USUARIOS.get('admin', {'nombre': 'La administración'})
-    with sqlite3.connect(UPDATES_DB, timeout=5) as conexion:
+    with conexion_db() as conexion:
         crear_tabla_telefonos(conexion)
         fila = conexion.execute('SELECT phone FROM authorized_phones WHERE user_id = ?',
                                 (usuario_id,)).fetchone()
@@ -354,7 +388,7 @@ def encolar_aviso_encendido(usuario_id, update_id):
              f'\n\n🕒 {fecha} (Costa Rica).'
              '\nConfirma que las sirenas estén sonando.')
     # Este aviso sale sin esperar ubicación y nunca incluye la antigua casa fija.
-    with sqlite3.connect(UPDATES_DB, timeout=5) as conexion:
+    with conexion_db() as conexion:
         encolar_para_autorizados(conexion, update_id, {'text': texto, 'disable_notification': False})
     iniciar_worker_avisos()
 
@@ -380,7 +414,7 @@ def encolar_retiro_boton(conexion, fila, texto):
 
 
 def descartar_ubicacion(usuario_id=None, aviso=None, excepto=None):
-    with sqlite3.connect(UPDATES_DB, timeout=5) as conexion:
+    with conexion_db() as conexion:
         crear_tabla_ubicaciones(conexion)
         conexion.execute('BEGIN IMMEDIATE')
         filas = conexion.execute('SELECT user_id, event_id, phone FROM pending_locations'
@@ -397,7 +431,7 @@ def descartar_ubicacion(usuario_id=None, aviso=None, excepto=None):
 
 
 def cerrar_ubicaciones_vencidas():
-    with sqlite3.connect(UPDATES_DB, timeout=5) as conexion:
+    with conexion_db() as conexion:
         crear_tabla_ubicaciones(conexion)
         conexion.execute('BEGIN IMMEDIATE')
         filas = conexion.execute('SELECT user_id, event_id, phone FROM pending_locations WHERE created < ?',
@@ -417,7 +451,7 @@ def solicitar_ubicacion_opcional(chat_id, usuario_id, update_id):
 
 def _solicitar_ubicacion_opcional(chat_id, usuario_id, update_id):
     ficha = ficha_usuario(usuario_id)
-    with sqlite3.connect(UPDATES_DB, timeout=5) as conexion:
+    with conexion_db() as conexion:
         crear_tabla_ubicaciones(conexion)
         crear_tabla_telefonos(conexion)
         fila = conexion.execute('SELECT phone FROM authorized_phones WHERE user_id = ?',
@@ -457,7 +491,7 @@ def procesar_ubicacion(chat_id, usuario_id, mensaje):
            for n, limite in ((lat, 90), (lon, 180))):
         enviar_mensaje_telegram(chat_id, 'No se pudo leer el punto. Podés continuar sin ubicación; la orden enviada no cambia.')
         return
-    with sqlite3.connect(UPDATES_DB, timeout=5) as conexion:
+    with conexion_db() as conexion:
         crear_tabla_ubicaciones(conexion)
         crear_tabla_telefonos(conexion)
         # Consumo y cola en una transacción: un punto no se difunde dos veces.
@@ -495,7 +529,7 @@ def procesar_ubicacion(chat_id, usuario_id, mensaje):
 def entregar_aviso_pendiente():
     """Un intento por llamada; los avisos nunca vuelven a ejecutar una escena."""
     ahora = time.time()
-    with sqlite3.connect(UPDATES_DB, timeout=5) as conexion:
+    with conexion_db() as conexion:
         crear_tabla_avisos(conexion)
         # No repartir alertas antiguas como si acabaran de ocurrir.
         conexion.execute('DELETE FROM pending_alerts WHERE created < ?', (ahora - 300,))
@@ -506,7 +540,7 @@ def entregar_aviso_pendiente():
     aviso_id, uid, telefono, contenido, intentos = fila
     autorizado = uid == MI_TELEGRAM_ID
     if not autorizado and telefono in TELEFONOS_AUTORIZADOS:
-        with sqlite3.connect(UPDATES_DB, timeout=5) as conexion:
+        with conexion_db() as conexion:
             crear_tabla_telefonos(conexion)
             vinculo = conexion.execute('SELECT phone FROM authorized_phones WHERE user_id = ?', (uid,)).fetchone()
         autorizado = bool(vinculo and vinculo[0] == telefono)
@@ -517,7 +551,7 @@ def entregar_aviso_pendiente():
     if autorizado:
         if restaurar:
             with _ubicacion_ui_lock:
-                with sqlite3.connect(UPDATES_DB, timeout=5) as conexion:
+                with conexion_db() as conexion:
                     crear_tabla_ubicaciones(conexion)
                     nueva = conexion.execute('SELECT 1 FROM pending_locations WHERE user_id = ?', (uid,)).fetchone()
                 # No ocultar el botón de una solicitud más reciente.
@@ -528,7 +562,7 @@ def entregar_aviso_pendiente():
         if exito and punto:
             # El texto ya tiene enlace al punto si esta segunda llamada falla.
             llamar_telegram('sendLocation', {'chat_id': uid, **punto, 'disable_notification': True})
-    with sqlite3.connect(UPDATES_DB, timeout=5) as conexion:
+    with conexion_db() as conexion:
         if exito or intentos >= 2:
             conexion.execute('DELETE FROM pending_alerts WHERE id = ?', (aviso_id,))
             if not exito:
@@ -544,6 +578,9 @@ def worker_avisos():
         try:
             cerrar_ubicaciones_vencidas()
             enviado = entregar_aviso_pendiente()
+        except sqlite3.Error as exc:
+            registrar_error_db('avisos en segundo plano', exc)
+            enviado = False
         except Exception:
             app.logger.error('Error temporal al repartir avisos; no se repiten órdenes a Tuya.')
             enviado = False
@@ -579,14 +616,14 @@ def procesar_contacto(chat_id, usuario_id, mensaje):
 
 
 def guardar_estado(nombre, contenido):
-    with sqlite3.connect(UPDATES_DB, timeout=5) as conexion:
+    with conexion_db() as conexion:
         conexion.execute('CREATE TABLE IF NOT EXISTS state (name TEXT PRIMARY KEY, payload TEXT NOT NULL)')
         conexion.execute('INSERT OR REPLACE INTO state VALUES (?, ?)',
                          (nombre, json.dumps(contenido)))
 
 
 def leer_estado(nombre):
-    with sqlite3.connect(UPDATES_DB, timeout=5) as conexion:
+    with conexion_db() as conexion:
         conexion.execute('CREATE TABLE IF NOT EXISTS state (name TEXT PRIMARY KEY, payload TEXT NOT NULL)')
         fila = conexion.execute('SELECT payload FROM state WHERE name = ?', (nombre,)).fetchone()
     return json.loads(fila[0]) if fila else None
@@ -702,7 +739,7 @@ def reservar_update(update_id):
     Se registra antes de ejecutar: un fallo posterior requiere una orden nueva.
     La protección dura mientras se conserve esta base de datos en esta instancia.
     """
-    with sqlite3.connect(UPDATES_DB, timeout=5) as conexion:
+    with conexion_db() as conexion:
         conexion.execute('CREATE TABLE IF NOT EXISTS updates (id INTEGER PRIMARY KEY, fecha REAL NOT NULL)')
         resultado = conexion.execute('INSERT OR IGNORE INTO updates VALUES (?, ?)', (update_id, time.time()))
         return resultado.rowcount == 1
@@ -757,9 +794,11 @@ def webhook_telegram():
     update_id = datos.get('update_id')
     if type(update_id) is not int or update_id < 0:
         return 'Falta update_id', 400
+    reservado = False
     try:
         if not reservar_update(update_id):
             return 'OK', 200
+        reservado = True
         texto_salida = mensaje.get('text', '')
         if (isinstance(texto_salida, str)
                 and texto_salida.strip().casefold() in ('/salir', 'salir', '🚪 salir del bot', '🚪 desvincularme', 'desvincularme')):
@@ -776,8 +815,16 @@ def webhook_telegram():
         if 'location' in mensaje:
             procesar_ubicacion(chat_id, remitente_id, mensaje)
             return 'OK', 200
-    except sqlite3.Error:
-        app.logger.error('Error al comprobar acceso; no se ejecutó ninguna orden.')
+    except sqlite3.Error as exc:
+        registrar_error_db('comprobar acceso (sin ejecutar órdenes)', exc)
+        # Ninguna escena se ejecuta en este bloque. Permitir reintentar el update
+        # después de un fallo de acceso, sin perder la orden por la deduplicación.
+        if reservado:
+            try:
+                with conexion_db() as conexion:
+                    conexion.execute('DELETE FROM updates WHERE id = ?', (update_id,))
+            except sqlite3.Error as limpieza:
+                registrar_error_db('liberar mensaje no ejecutado', limpieza)
         return 'Error temporal', 503
     texto = mensaje.get('text', '')
     if not isinstance(texto, str):
